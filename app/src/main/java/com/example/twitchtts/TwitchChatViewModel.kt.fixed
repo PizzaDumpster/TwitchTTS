@@ -516,13 +516,7 @@ class TwitchChatViewModel : ViewModel() {
     fun setSpeechRate(rate: Float) {
         if (rate in 0.5f..2.0f) {
             speechRate.value = rate
-            try {
-                if (textToSpeech != null) {
-                    textToSpeech?.setSpeechRate(rate)
-                }
-            } catch (e: Exception) {
-                Log.e("TTS", "Error setting speech rate", e)
-            }
+            textToSpeech?.setSpeechRate(rate)
         }
     }
     

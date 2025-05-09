@@ -1,9 +1,11 @@
 package com.example.twitchtts
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,11 +15,12 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +36,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.twitchtts.ui.theme.TwitchTTSTheme
 import kotlinx.coroutines.launch
 import androidx.core.graphics.toColorInt
+import kotlinx.coroutines.delay
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -80,8 +84,9 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
     val currentQueueSize by viewModel.currentQueueSize
     val speechRate by viewModel.speechRate
 
-    // Speech rate slider dialog state
+    // Dialog states
     var showSpeechRateDialog by remember { mutableStateOf(false) }
+    var showVoiceSelectionDialog by remember { mutableStateOf(false) }
 
     // Create a LazyListState to control scrolling
     val lazyListState = rememberLazyListState()
@@ -111,14 +116,20 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
+                    var temporarySpeechRate by remember { mutableStateOf(speechRate) }
+                    
                     Text(
-                        "${String.format(Locale.US, "%.1f", speechRate)}x",
+                        "${String.format(Locale.US, "%.1f", temporarySpeechRate)}x",
                         style = MaterialTheme.typography.bodyLarge,
                         modifier = Modifier.padding(bottom = 8.dp)
                     )
+                    
                     Slider(
-                        value = speechRate,
-                        onValueChange = { viewModel.setSpeechRate(it) },
+                        value = temporarySpeechRate,
+                        onValueChange = { temporarySpeechRate = it },
+                        onValueChangeFinished = { 
+                            viewModel.setSpeechRate(temporarySpeechRate) 
+                        },
                         valueRange = 0.5f..2.0f,
                         steps = 15,
                         modifier = Modifier.padding(horizontal = 8.dp)
@@ -135,6 +146,196 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
             confirmButton = {
                 Button(onClick = { showSpeechRateDialog = false }) {
                     Text("Done")
+                }
+            }
+        )
+    }
+    
+    // Voice selection dialog
+    if (showVoiceSelectionDialog) {
+        val availableVoices = viewModel.availableVoices
+        val selectedVoice by viewModel.selectedVoice
+        
+        AlertDialog(
+            onDismissRequest = { showVoiceSelectionDialog = false },
+            title = { 
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Select Voice")
+                    Text(
+                        "(${availableVoices.size} voices)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            text = {
+                if (availableVoices.isEmpty()) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator()
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text("Loading available voices...")
+                        }
+                    }
+                } else {
+                    // Create a state for the lazy list to enable scrolling
+                    val voiceListState = rememberLazyListState()
+                    // Add search functionality
+                    var searchQuery by remember { mutableStateOf("") }
+                    
+                    // Filter voices based on search query
+                    val filteredVoices = if (searchQuery.isEmpty()) {
+                        availableVoices
+                    } else {
+                        availableVoices.filter { 
+                            it.name.contains(searchQuery, ignoreCase = true) ||
+                            it.locale.displayName.contains(searchQuery, ignoreCase = true)
+                        }
+                    }
+                    
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        // Search box
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp),
+                            placeholder = { Text("Search voices...") },
+                            singleLine = true,
+                            leadingIcon = { 
+                                Icon(
+                                    Icons.Default.Mic, 
+                                    contentDescription = "Search"
+                                )
+                            },
+                            trailingIcon = {
+                                if (searchQuery.isNotEmpty()) {
+                                    IconButton(onClick = { searchQuery = "" }) {
+                                        Icon(
+                                            Icons.Default.Clear,
+                                            contentDescription = "Clear search"
+                                        )
+                                    }
+                                }
+                            }
+                        )
+                        
+                        // Display result count when searching
+                        if (searchQuery.isNotEmpty()) {
+                            Text(
+                                text = "${filteredVoices.size} matching voices",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                        }
+                        
+                        LazyColumn(
+                            state = voiceListState,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 200.dp, max = 350.dp) // Adjust height to accommodate search box
+                        ) {
+                        items(
+                            items = filteredVoices,
+                            key = { voice -> voice.id }
+                        ) { voice ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp)
+                                    .clickable {
+                                        // Use coroutine to avoid UI thread blocking
+                                        coroutineScope.launch {
+                                            try {
+                                                viewModel.setVoice(voice)
+                                                delay(500) // Wait longer for voice to be applied
+                                                viewModel.speakTestPhrase()
+                                            } catch(e: Exception) {
+                                                Log.e("TwitchTTS", "Error selecting voice", e)
+                                            }
+                                        }
+                                    }
+                                    .padding(8.dp)
+                            ) {
+                                RadioButton(
+                                    selected = voice.id == selectedVoice?.id,
+                                    onClick = { 
+                                        coroutineScope.launch {
+                                            try {
+                                                // Ensure we don't already have this voice selected to avoid unnecessary changes
+                                                if (voice.id != selectedVoice?.id) {
+                                                    viewModel.setVoice(voice)
+                                                }
+                                            } catch (e: Exception) {
+                                                Log.e("TwitchTTS", "Error selecting voice", e)
+                                            }
+                                        }
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = voice.name,
+                                        style = MaterialTheme.typography.bodyLarge
+                                    )
+                                    Text(
+                                        text = voice.locale.displayName,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    } // Close the Column
+                }
+            },
+            confirmButton = {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Test selected voice button
+                    OutlinedButton(
+                        onClick = { 
+                            selectedVoice?.let { 
+                                coroutineScope.launch {
+                                    try {
+                                        // Make sure there's a small delay before testing
+                                        delay(150)
+                                        viewModel.speakTestPhrase()
+                                    } catch (e: Exception) {
+                                        Log.e("TwitchTTS", "Error testing voice", e)
+                                    }
+                                }
+                            }
+                        },
+                        enabled = selectedVoice != null
+                    ) {
+                        Icon(
+                            Icons.Filled.Mic,
+                            contentDescription = "Test Voice",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text("Test")
+                    }
+                    
+                    // Done button
+                    Button(onClick = { showVoiceSelectionDialog = false }) {
+                        Text("Done")
+                    }
                 }
             }
         )
@@ -180,6 +381,16 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
                             Icon(
                                 Icons.Default.Speed,
                                 contentDescription = "Adjust speech rate"
+                            )
+                        }
+                    }
+                    
+                    // Voice selection button
+                    if (isTtsEnabled) {
+                        IconButton(onClick = { showVoiceSelectionDialog = true }) {
+                            Icon(
+                                Icons.Default.Mic,
+                                contentDescription = "Select voice"
                             )
                         }
                     }
