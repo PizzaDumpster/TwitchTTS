@@ -258,8 +258,15 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
                                         // Use coroutine to avoid UI thread blocking
                                         coroutineScope.launch {
                                             try {
+                                                // Show slight feedback to user that selection is in progress
+                                                // by using a small delay before selection
+                                                delay(50)
                                                 viewModel.setVoice(voice)
-                                                delay(500) // Wait longer for voice to be applied
+                                                
+                                                // Wait longer for voice to be applied before testing
+                                                delay(700) 
+                                                
+                                                // Test the voice after selection
                                                 viewModel.speakTestPhrase()
                                             } catch(e: Exception) {
                                                 Log.e("TwitchTTS", "Error selecting voice", e)
@@ -275,10 +282,15 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
                                             try {
                                                 // Ensure we don't already have this voice selected to avoid unnecessary changes
                                                 if (voice.id != selectedVoice?.id) {
+                                                    // Prevent rapid clicking from causing issues
+                                                    delay(50)
                                                     viewModel.setVoice(voice)
+                                                    
+                                                    // Don't automatically speak test phrase for radio button
+                                                    // as it could be confusing - user can click Test button
                                                 }
                                             } catch (e: Exception) {
-                                                Log.e("TwitchTTS", "Error selecting voice", e)
+                                                Log.e("TwitchTTS", "Error selecting voice via radio button", e)
                                             }
                                         }
                                     }
@@ -309,14 +321,18 @@ fun TwitchChatScreen(viewModel: TwitchChatViewModel = viewModel()) {
                     // Test selected voice button
                     OutlinedButton(
                         onClick = { 
-                            selectedVoice?.let { 
+                            selectedVoice?.let { voice ->
                                 coroutineScope.launch {
                                     try {
                                         // Make sure there's a small delay before testing
                                         delay(150)
-                                        viewModel.speakTestPhrase()
+                                        
+                                        // Test if we still have a valid voice and TTS engine
+                                        if (selectedVoice != null) {
+                                            viewModel.speakTestPhrase()
+                                        }
                                     } catch (e: Exception) {
-                                        Log.e("TwitchTTS", "Error testing voice", e)
+                                        Log.e("TwitchTTS", "Error testing voice from test button", e)
                                     }
                                 }
                             }

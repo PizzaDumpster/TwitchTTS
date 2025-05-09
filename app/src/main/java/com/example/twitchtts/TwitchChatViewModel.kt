@@ -515,14 +515,51 @@ class TwitchChatViewModel : ViewModel() {
     // Set speech rate
     fun setSpeechRate(rate: Float) {
         if (rate in 0.5f..2.0f) {
+            // Store current state before changing rate
+            val wasSpeaking = isSpeaking
+            val utteranceInProgress = wasSpeaking && ttsQueue.isNotEmpty()
+            
+            // Apply new rate to the state
             speechRate.value = rate
+            
             try {
                 if (textToSpeech != null) {
+                    // Apply the new speech rate to the TTS engine
                     textToSpeech?.setSpeechRate(rate)
+                    Log.d("TTS", "Speech rate set to $rate")
+                    
+                    // Special handling for when speech is active
+                    if (utteranceInProgress) {
+                        Log.d("TTS", "Speech rate changed while speaking")
+                        
+                        // For some TTS engines, changing rate mid-speech can cause instability
+                        // Monitor the speech state for a short period to ensure proper continuation
+                        viewModelScope.launch {
+                            // Wait a short time to allow the TTS engine to adjust
+                            delay(100)
+                            
+                            // If speech was interrupted by the rate change, restore proper state
+                            if (wasSpeaking && !isSpeaking && ttsQueue.isNotEmpty()) {
+                                Log.d("TTS", "Speech was interrupted by rate change, restarting")
+                                processNextTtsItem()
+                            }
+                        }
+                    }
+                } else {
+                    Log.w("TTS", "TextToSpeech engine is null, can't set speech rate")
                 }
             } catch (e: Exception) {
                 Log.e("TTS", "Error setting speech rate", e)
+                
+                // If we encountered an error during rate change while speaking,
+                // make sure we recover properly
+                if (wasSpeaking) {
+                    // Try to reset speaking state and continue with queue
+                    resetSpeakingState()
+                }
             }
+        } else {
+            Log.w("TTS", "Invalid speech rate: $rate, must be between 0.5 and 2.0")
         }
     }
     
@@ -531,6 +568,12 @@ class TwitchChatViewModel : ViewModel() {
      */
     fun setVoice(voice: Voice) {
         try {
+            // First check if TextToSpeech is null - fail early if it is
+            if (textToSpeech == null) {
+                Log.e("TTS", "Cannot set voice: TTS engine is null")
+                return
+            }
+            
             Log.d("TTS", "Changing voice to: ${voice.name}")
             
             // Store current state before voice change
@@ -550,80 +593,123 @@ class TwitchChatViewModel : ViewModel() {
             // Reset audio focus
             abandonAudioFocus()
             
-            // Set the selected voice
-            selectedVoice.value = voice
+            // Safe update of the selected voice state
+            viewModelScope.launch(Dispatchers.Main) {
+                selectedVoice.value = voice
+            }
             
-            // Small delay to ensure the TTS engine is ready for the voice change
+            // Handle the voice change in a separate coroutine with proper error handling
             viewModelScope.launch {
-                delay(100)
-                
-                // Apply the new voice
                 try {
+                    Log.d("TTS", "Starting voice change process for ${voice.name}")
+                    
+                    // First, make sure the TTS engine is fully stopped before changing voice
+                    textToSpeech?.stop()
+                    delay(150) // Wait a bit longer to ensure the engine is stopped
+                    
+                    var voiceSetSuccess = false
+                    
+                    // Try to set the voice with different approaches
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                        // Set voice directly if we have the Android Voice object
+                        // Method 1: Try direct voice object setting
                         voice.androidVoice?.let { androidVoice ->
-                            val result = textToSpeech?.setVoice(androidVoice)
-                            if (result == TextToSpeech.ERROR) {
-                                Log.e("TTS", "Failed to set voice: ${voice.name}")
-                                
-                                // Try fallback to locale
-                                textToSpeech?.setLanguage(voice.locale)
-                            } else {
-                                Log.d("TTS", "Voice set to: ${voice.name}")
+                            try {
+                                val result = textToSpeech?.setVoice(androidVoice)
+                                if (result == TextToSpeech.SUCCESS) {
+                                    Log.d("TTS", "Voice set to: ${voice.name} successfully")
+                                    voiceSetSuccess = true
+                                } else {
+                                    Log.w("TTS", "Failed to set voice directly: ${voice.name}, error code: $result")
+                                }
+                            } catch (e: Exception) {
+                                Log.e("TTS", "Error setting voice directly", e)
                             }
-                        } ?: run {
-                            // If we don't have the Android Voice object, try setting by locale
-                            Log.d("TTS", "No Android Voice object, setting by locale: ${voice.locale}")
-                            textToSpeech?.setLanguage(voice.locale)
+                        } 
+                        
+                        // Method 2: If direct voice setting failed or no voice object, try by locale
+                        if (!voiceSetSuccess) {
+                            try {
+                                Log.d("TTS", "Trying to set voice by locale: ${voice.locale}")
+                                val localeResult = textToSpeech?.setLanguage(voice.locale)
+                                if (localeResult == TextToSpeech.LANG_AVAILABLE || 
+                                    localeResult == TextToSpeech.LANG_COUNTRY_AVAILABLE ||
+                                    localeResult == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE) {
+                                    Log.d("TTS", "Voice locale set successfully")
+                                    voiceSetSuccess = true
+                                } else {
+                                    Log.w("TTS", "Failed to set voice by locale, error code: $localeResult")
+                                }
+                            } catch (e: Exception) {
+                                Log.e("TTS", "Error setting voice by locale", e)
+                            }
                         }
                     } else {
-                        // For older versions, try to set the language that matches the voice
-                        textToSpeech?.setLanguage(voice.locale)
+                        // For older Android versions, we can only set by locale
+                        try {
+                            val result = textToSpeech?.setLanguage(voice.locale)
+                            if (result == TextToSpeech.LANG_AVAILABLE || 
+                                result == TextToSpeech.LANG_COUNTRY_AVAILABLE ||
+                                result == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE) {
+                                Log.d("TTS", "Voice locale set successfully (older Android)")
+                                voiceSetSuccess = true
+                            }
+                        } catch (e: Exception) {
+                            Log.e("TTS", "Error setting voice on older Android", e)
+                        }
                     }
                     
-                    delay(250) // Give the TTS engine more time to apply the voice change
-                    
-                    // Restore the queue if we were active before
-                    if (wasSpeaking || queueContents.isNotEmpty()) {
-                        // Add back the queue contents
-                        if (queueContents.isNotEmpty()) {
-                            ttsQueue.addAll(queueContents)
-                            updateQueueSize()
-                            Log.d("TTS", "Restored ${queueContents.size} messages to queue")
-                        }
-                        
-                        // Restore TTS enabled state
-                        isTtsEnabled.value = currentTtsEnabled
-                        
-                        // Resume processing if needed
-                        if (currentTtsEnabled && !isSpeaking && ttsQueue.isNotEmpty()) {
-                            delay(200) // Longer delay for stability
-                            processNextTtsItem()
-                        }
-                    } else {
-                        // Just restore the TTS enabled state
-                        isTtsEnabled.value = currentTtsEnabled
+                    // If we couldn't set the voice, log a warning but continue execution
+                    if (!voiceSetSuccess) {
+                        Log.w("TTS", "Could not set requested voice, will continue with default")
                     }
+                    
+                    // Wait a bit longer for voice change to take effect
+                    delay(300)
+                    
+                    // Always restore the state, even if voice change failed
+                    restoreStateAfterVoiceChange(currentTtsEnabled, wasSpeaking, queueContents)
                 } catch (e: Exception) {
-                    Log.e("TTS", "Error applying voice change", e)
-                    // Restore TTS state even if there was an error
-                    isTtsEnabled.value = currentTtsEnabled
-                    
-                    // Make sure we restore queue contents even if voice change failed
-                    if (queueContents.isNotEmpty()) {
-                        ttsQueue.addAll(queueContents)
-                        updateQueueSize()
-                        Log.d("TTS", "Restored queue after voice change error")
-                        
-                        if (currentTtsEnabled && !isSpeaking) {
-                            delay(200)
-                            processNextTtsItem()
-                        }
+                    Log.e("TTS", "Exception during voice change process", e)
+                    // Make sure we restore state even in case of errors
+                    try {
+                        delay(200)
+                        restoreStateAfterVoiceChange(currentTtsEnabled, wasSpeaking, queueContents)
+                    } catch (e2: Exception) {
+                        Log.e("TTS", "Failed to restore state after voice change error", e2)
+                        // Last resort - try to at least restore TTS enabled state
+                        isTtsEnabled.value = currentTtsEnabled
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.e("TTS", "Error setting voice", e)
+            Log.e("TTS", "Error in setVoice method", e)
+        }
+    }
+    
+    // Helper method to restore state after voice change
+    private suspend fun restoreStateAfterVoiceChange(
+        previousTtsEnabled: Boolean,
+        wasSpeaking: Boolean,
+        queueContents: List<String>
+    ) {
+        try {
+            // First restore the queue
+            if (queueContents.isNotEmpty()) {
+                ttsQueue.addAll(queueContents)
+                updateQueueSize()
+                Log.d("TTS", "Restored ${queueContents.size} messages to queue after voice change")
+            }
+            
+            // Then restore the TTS enabled state
+            isTtsEnabled.value = previousTtsEnabled
+            
+            // Finally, resume processing if needed
+            if (previousTtsEnabled && !isSpeaking && ttsQueue.isNotEmpty()) {
+                delay(100) // Short delay for stability
+                processNextTtsItem()
+            }
+        } catch (e: Exception) {
+            Log.e("TTS", "Error restoring state after voice change", e)
         }
     }
     
@@ -632,6 +718,9 @@ class TwitchChatViewModel : ViewModel() {
      */
     fun speakTestPhrase() {
         viewModelScope.launch {
+            // Store current state - moved to outer scope to be accessible in all blocks
+            val currentTtsEnabled = isTtsEnabled.value
+            
             try {
                 if (textToSpeech == null) {
                     Log.e("TTS", "Cannot speak test phrase: TTS engine is null")
@@ -643,99 +732,156 @@ class TwitchChatViewModel : ViewModel() {
                 
                 Log.d("TTS", "Preparing to speak test phrase")
                 
-                // Store current state
-                val currentTtsEnabled = isTtsEnabled.value
+                // Store speaking state
                 val wasSpeaking = isSpeaking
                 
-                // Temporarily disable TTS to prevent new messages from being added during test
-                isTtsEnabled.value = false
-                
-                // Stop any current speech
-                textToSpeech?.stop()
-                
-                // Reset speaking state
-                isSpeaking = false
-                
-                // Store current queue contents temporarily if needed
-                val queueContents = if (ttsQueue.isNotEmpty()) ArrayList(ttsQueue) else null
-                
-                // Clear the TTS queue to ensure test phrase plays immediately
-                ttsQueue.clear()
-                updateQueueSize()
-                
-                // Abandon previous audio focus
-                abandonAudioFocus()
-                delay(100) // Longer delay to allow audio focus release
-                
-                // Get fresh audio focus for the test phrase
-                val audioFocusResult = requestAudioFocusAndWait()
-                if (audioFocusResult == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
-                    Log.w("TTS", "Failed to get audio focus for test phrase")
+                // Safely store the current queue contents if needed
+                val queueContents = try {
+                    if (ttsQueue.isNotEmpty()) ArrayList(ttsQueue) else null
+                } catch (e: Exception) {
+                    Log.e("TTS", "Error creating queue copy", e)
+                    null
                 }
                 
-                // Mark as speaking for the test phrase
-                isSpeaking = true
-                
-                // Speak the test phrase with QUEUE_FLUSH to interrupt anything currently playing
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    val bundle = Bundle()
-                    bundle.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-                    val result = textToSpeech?.speak(testPhrase, TextToSpeech.QUEUE_FLUSH, bundle, utteranceId)
-                    if (result == TextToSpeech.ERROR) {
-                        Log.e("TTS", "Error speaking test phrase")
-                        isSpeaking = false
-                    }
-                } else {
-                    @Suppress("DEPRECATION")
-                    val params = HashMap<String, String>()
-                    params[TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID] = utteranceId
-                    val result = textToSpeech?.speak(testPhrase, TextToSpeech.QUEUE_FLUSH, params)
-                    if (result == TextToSpeech.ERROR) {
-                        Log.e("TTS", "Error speaking test phrase")
-                        isSpeaking = false
-                    }
-                }
-                
-                Log.d("TTS", "Speaking test phrase with voice: ${selectedVoice.value?.name}")
-                
-                // We'll wait for the test phrase to finish
-                // The utterance listener should handle the onDone event for test phrases
-                // but as a fallback, we use a delay and manual restoration
-                
-                // Wait for 3 seconds to make sure the test phrase has time to complete
-                // This is a fallback in case the utterance callbacks aren't properly received
-                delay(3000)
-                
-                // Reset state after test phrase
-                if (isSpeaking) {
-                    Log.d("TTS", "Test phrase didn't complete via callbacks, manually resetting state")
+                try {
+                    // Temporarily disable TTS to prevent new messages from being added during test
+                    isTtsEnabled.value = false
+                    
+                    // Stop any current speech
                     textToSpeech?.stop()
+                    
+                    // Reset speaking state
                     isSpeaking = false
-                    abandonAudioFocus()
-                }
-                
-                // Restore queue if needed
-                if (queueContents != null && queueContents.isNotEmpty()) {
-                    ttsQueue.addAll(queueContents)
+                    
+                    // Clear the TTS queue to ensure test phrase plays immediately
+                    ttsQueue.clear()
                     updateQueueSize()
-                    Log.d("TTS", "Restored ${queueContents.size} messages to queue after test")
+                    
+                    // Abandon previous audio focus
+                    abandonAudioFocus()
+                    delay(150) // Longer delay to allow audio focus release
+                    
+                    // Get fresh audio focus for the test phrase
+                    val audioFocusResult = requestAudioFocusAndWait()
+                    if (audioFocusResult == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
+                        Log.w("TTS", "Failed to get audio focus for test phrase")
+                    }
+                } catch (e: Exception) {
+                    Log.e("TTS", "Error preparing for test phrase", e)
                 }
                 
-                // Restore TTS enabled state
-                isTtsEnabled.value = currentTtsEnabled
+                // Try to speak with robust error handling
+                var speakSuccess = false
                 
-                // Resume processing if we were speaking before
-                if (currentTtsEnabled && !isSpeaking && ttsQueue.isNotEmpty()) {
-                    delay(200) // Longer delay for stability
-                    processNextTtsItem()
+                try {
+                    // Mark as speaking for the test phrase
+                    isSpeaking = true
+                    
+                    // Speak the test phrase with QUEUE_FLUSH to interrupt anything currently playing
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                        val bundle = Bundle()
+                        bundle.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
+                        
+                        // Make sure the textToSpeech engine is available
+                        val tts = textToSpeech
+                        if (tts != null) {
+                            val result = tts.speak(testPhrase, TextToSpeech.QUEUE_FLUSH, bundle, utteranceId)
+                            if (result == TextToSpeech.SUCCESS) {
+                                Log.d("TTS", "Started speaking test phrase successfully")
+                                speakSuccess = true
+                            } else {
+                                Log.e("TTS", "Error speaking test phrase, result code: $result")
+                                isSpeaking = false
+                            }
+                        } else {
+                            Log.e("TTS", "TTS engine became null during test")
+                            isSpeaking = false
+                        }
+                    } else {
+                        // For older Android versions
+                        @Suppress("DEPRECATION")
+                        val params = HashMap<String, String>()
+                        params[TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID] = utteranceId
+                        val result = textToSpeech?.speak(testPhrase, TextToSpeech.QUEUE_FLUSH, params)
+                        if (result == TextToSpeech.SUCCESS) {
+                            speakSuccess = true
+                        } else {
+                            Log.e("TTS", "Error speaking test phrase on older Android")
+                            isSpeaking = false
+                        }
+                    }
+                    
+                    if (speakSuccess) {
+                        Log.d("TTS", "Speaking test phrase with voice: ${selectedVoice.value?.name}")
+                        
+                        // The utterance listener should handle the onDone event, but as a fallback,
+                        // we use a delay and manual restoration (shorter timeout than before)
+                        val timeoutMs = 2500L
+                        delay(timeoutMs)
+                        
+                        // Reset state after test phrase if the callback hasn't fired
+                        if (isSpeaking) {
+                            Log.d("TTS", "Test phrase didn't complete via callbacks after ${timeoutMs}ms, manually resetting")
+                            textToSpeech?.stop()
+                            isSpeaking = false
+                            abandonAudioFocus()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("TTS", "Exception while speaking test phrase", e)
+                    isSpeaking = false
+                } finally {
+                    // Always restore state, even if there was an error
+                    try {
+                        // Make double sure we're not in speaking state
+                        if (isSpeaking) {
+                            textToSpeech?.stop()
+                            isSpeaking = false
+                            abandonAudioFocus()
+                        }
+                        
+                        // Restore queue if needed
+                        if (queueContents != null && queueContents.isNotEmpty()) {
+                            ttsQueue.addAll(queueContents)
+                            updateQueueSize()
+                            Log.d("TTS", "Restored ${queueContents.size} messages to queue after test")
+                        }
+                        
+                        // Restore TTS enabled state
+                        isTtsEnabled.value = currentTtsEnabled
+                        
+                        // Resume processing if needed
+                        if (currentTtsEnabled && !isSpeaking && ttsQueue.isNotEmpty()) {
+                            delay(200) // Longer delay for stability
+                            processNextTtsItem()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("TTS", "Error during test phrase cleanup", e)
+                        // Last resort - make sure TTS is enabled if it was before
+                        isTtsEnabled.value = currentTtsEnabled
+                    }
                 }
             } catch (e: Exception) {
-                Log.e("TTS", "Error speaking test phrase", e)
+                Log.e("TTS", "Error in speakTestPhrase", e)
+                
+                // Make sure speaking state is reset
                 isSpeaking = false
                 
-                // Make sure we re-enable TTS if it was enabled before the error
-                if (!isTtsEnabled.value) {
+                // Make sure audio focus is abandoned
+                try {
+                    abandonAudioFocus()
+                } catch (e2: Exception) {
+                    Log.e("TTS", "Error abandoning audio focus after test phrase error", e2) 
+                }
+                
+                // Make sure TTS is re-enabled if it was enabled before
+                if (currentTtsEnabled && !isTtsEnabled.value) {
                     isTtsEnabled.value = true
+                }
+                
+                // Final error recovery - try to reset the TTS engine entirely if needed
+                if (textToSpeech == null) {
+                    Log.w("TTS", "TTS engine became null, attempting to recover later")
                 }
             }
         }
